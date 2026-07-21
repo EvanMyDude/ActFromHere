@@ -128,6 +128,12 @@ export async function adoptRemoteIfNewer() {
 
 // ---------- window.storage adapter (component contract) ----------
 export function installStorageAdapter() {
+  // A brand-new device auto-seeds default content on first boot. That seed must
+  // NEVER outrank real data on another device in last-write-wins sync — so the
+  // first-ever write on a previously-empty device gets watermark 1 (always loses)
+  // and is not pushed. Any actual user change stamps real time and syncs normally.
+  const hadDataAtBoot = localStorage.getItem(DATA_KEY) !== null;
+  let wroteBefore = false;
   window.storage = {
     async get(key) {
       const v = localStorage.getItem(key);
@@ -136,7 +142,16 @@ export function installStorageAdapter() {
     },
     async set(key, value) {
       localStorage.setItem(key, value);
-      if (key === DATA_KEY) { setMeta({ savedAt: now() }); schedulePush(); }
+      if (key === DATA_KEY) {
+        const seedWrite = !hadDataAtBoot && !wroteBefore;
+        wroteBefore = true;
+        if (seedWrite) {
+          setMeta({ savedAt: 1 });
+        } else {
+          setMeta({ savedAt: now() });
+          schedulePush();
+        }
+      }
       return { key, value, shared: false };
     },
     async delete(key) { localStorage.removeItem(key); return { key, deleted: true, shared: false }; },

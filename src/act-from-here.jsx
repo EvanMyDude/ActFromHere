@@ -462,6 +462,10 @@ export default function ActFromHere() {
         }),
       });
       const resp = await response.json();
+      if (!response.ok || (resp && resp.type === "error")) {
+        const msg = resp && resp.error && resp.error.message ? resp.error.message : `HTTP ${response.status}`;
+        throw new Error(msg);
+      }
       const textOut = (resp.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
       const clean = textOut.replace(/```json|```/g, "").trim();
       const arr = JSON.parse(clean);
@@ -485,6 +489,7 @@ export default function ActFromHere() {
       }, 1800);
     } catch (e) {
       console.error(e);
+      const reason = String(e && e.message ? e.message : e).slice(0, 90);
       // fallback: raw lines land in the last section so nothing is lost
       const st = cur();
       if (!st.sections.length) { setSorting(false); return; }
@@ -492,7 +497,7 @@ export default function ActFromHere() {
       const lines = raw.split("\n").map((l) => l.trim()).filter((l) => l && !/^[=^\-\s]+$/.test(l));
       persist({ ...st, items: { ...st.items, [catchAll]: [...lines.map((l) => ({ id: uid(), text: l, done: false, fresh: true })), ...st.items[catchAll]] } });
       setDump("");
-      flash(`Sort failed — dumped into ${labelFor(catchAll)} as-is, nothing lost`);
+      flash(`Sort failed (${reason}) — dumped into ${labelFor(catchAll)} as-is, nothing lost`);
     } finally {
       setSorting(false);
     }

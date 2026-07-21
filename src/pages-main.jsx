@@ -188,8 +188,20 @@ export function installAnthropicShim() {
     if (typeof url === "string" && url.startsWith("https://api.anthropic.com/")) {
       const key = localStorage.getItem(K_ANTHROPIC);
       if (!key) return Promise.reject(new Error("No Anthropic API key set — open the ⇄ panel. Your dump stays put."));
+      // The claude.ai artifact environment capped max_tokens at 1000; a big dump's
+      // JSON gets truncated at that cap and fails to parse. Direct API on the
+      // user's own key has no such constraint — raise the ceiling.
+      let body = opts.body;
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed && typeof parsed.max_tokens === "number" && parsed.max_tokens <= 1024) {
+          parsed.max_tokens = 4000;
+          body = JSON.stringify(parsed);
+        }
+      } catch (e) {}
       opts = {
         ...opts,
+        body,
         headers: {
           ...(opts.headers || {}),
           "x-api-key": key,

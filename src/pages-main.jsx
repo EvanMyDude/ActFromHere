@@ -15,10 +15,16 @@ const K_GH_TOKEN = "afh-gh-token";
 const K_GIST_ID = "afh-gist-id";
 const GIST_DESC = "act-from-here-data"; // constant → second device finds the same gist
 const GIST_FILE = "actfromhere.json";
+const CONFLICT_KEY = "afh-conflict-backup";
 const PUSH_DEBOUNCE = 2500;
 
 const now = () => Date.now();
-const getMeta = () => { try { return JSON.parse(localStorage.getItem(META_KEY)) || { savedAt: 0 }; } catch { return { savedAt: 0 }; } };
+const getMeta = () => {
+  try {
+    const m = JSON.parse(localStorage.getItem(META_KEY)) || {};
+    return { savedAt: m.savedAt || 0, pushedAt: m.pushedAt || 0 };
+  } catch { return { savedAt: 0, pushedAt: 0 }; }
+};
 const setMeta = (m) => localStorage.setItem(META_KEY, JSON.stringify(m));
 
 // ---------- sync engine (gist) ----------
@@ -64,14 +70,18 @@ export async function pushToGist() {
   try {
     const id = await findOrCreateGist(token);
     const payload = { savedAt: getMeta().savedAt, data: localStorage.getItem(DATA_KEY) };
+    const body = JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(payload) } } });
     const res = await fetch(`https://api.github.com/gists/${id}`, {
       method: "PATCH",
       headers: ghHeaders(token),
-      body: JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(payload) } } }),
-      keepalive: true,
+      body,
+      // keepalive lets the request finish after the page is backgrounded, but
+      // browsers cap keepalive bodies (~64KB) — fall back for oversized states
+      keepalive: body.length < 60000,
     });
     if (!res.ok) throw new Error(`push failed (${res.status})`);
     sync.lastPushedAt = payload.savedAt;
+    setMeta({ ...getMeta(), pushedAt: payload.savedAt });
     setStatus("ok");
   } catch (e) {
     console.error("gist push:", e);
@@ -110,9 +120,15 @@ export async function pullFromGist({ timeoutMs = 4000 } = {}) {
 export async function adoptRemoteIfNewer() {
   try {
     const remote = await pullFromGist();
-    if (remote && remote.data && remote.savedAt > getMeta().savedAt) {
+    const m = getMeta();
+    if (remote && remote.data && remote.savedAt > m.savedAt) {
+      // Local holds edits that never reached the gist AND remote moved past them:
+      // last-write-wins takes remote, but the loser is stashed — never silently lost.
+      if (m.savedAt > m.pushedAt && localStorage.getItem(DATA_KEY)) {
+        localStorage.setItem(CONFLICT_KEY, JSON.stringify({ savedAt: m.savedAt, stashedAt: now(), data: localStorage.getItem(DATA_KEY) }));
+      }
       localStorage.setItem(DATA_KEY, remote.data);
-      setMeta({ savedAt: remote.savedAt });
+      setMeta({ savedAt: remote.savedAt, pushedAt: remote.savedAt });
       sync.lastPushedAt = remote.savedAt;
       setStatus("ok");
       return true;
@@ -130,10 +146,9 @@ export async function adoptRemoteIfNewer() {
 export function installStorageAdapter() {
   // A brand-new device auto-seeds default content on first boot. That seed must
   // NEVER outrank real data on another device in last-write-wins sync — so the
-  // first-ever write on a previously-empty device gets watermark 1 (always loses)
-  // and is not pushed. Any actual user change stamps real time and syncs normally.
-  const hadDataAtBoot = localStorage.getItem(DATA_KEY) !== null;
-  let wroteBefore = false;
+  // write that CREATES the data key gets watermark 1 (always loses) and is not
+  // pushed. Checked per-write, not at boot: a gist adoption creates the key too,
+  // so the first user edit after adopting is correctly treated as real data.
   window.storage = {
     async get(key) {
       const v = localStorage.getItem(key);
@@ -141,14 +156,14 @@ export function installStorageAdapter() {
       return { key, value: v, shared: false };
     },
     async set(key, value) {
+      const existedBefore = key !== DATA_KEY || localStorage.getItem(DATA_KEY) !== null;
       localStorage.setItem(key, value);
       if (key === DATA_KEY) {
-        const seedWrite = !hadDataAtBoot && !wroteBefore;
-        wroteBefore = true;
+        const seedWrite = !existedBefore;
         if (seedWrite) {
-          setMeta({ savedAt: 1 });
+          setMeta({ savedAt: 1, pushedAt: 1 });
         } else {
-          setMeta({ savedAt: now() });
+          setMeta({ ...getMeta(), savedAt: now() });
           schedulePush();
         }
       }
@@ -258,6 +273,17 @@ function SyncPanel() {
     e.target.value = "";
   };
 
+  const downloadConflict = () => {
+    const raw = localStorage.getItem(CONFLICT_KEY);
+    if (!raw) return;
+    const blob = new Blob([raw], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "afh-conflict-backup.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
   const statusDot = sync.status === "ok" ? P.green : sync.status === "pending" ? P.blue : sync.status === "error" ? P.red : P.faint;
   const statusLabel = { off: "sync off — this device only", ok: "synced to gist", pending: "syncing…", error: "sync error: " + sync.lastError, pulling: "checking remote…" }[sync.status] || sync.status;
 
@@ -285,6 +311,15 @@ function SyncPanel() {
               className="font-mono text-xs px-2 py-1.5 rounded-md" style={{ color: P.text, border: `1px solid ${P.edge}`, background: "transparent" }}>pull</button>
           </div>
           {msg && <div className="font-mono text-xs mt-2" style={{ color: P.dim }}>{msg}</div>}
+          {localStorage.getItem(CONFLICT_KEY) && (
+            <div className="mt-2 pt-2" style={{ borderTop: `1px solid ${P.edge}` }}>
+              <div className="font-mono text-xs mb-1" style={{ color: P.red }}>a device's unsynced edits were superseded — backup saved</div>
+              <div className="flex gap-2">
+                <button onClick={downloadConflict} className="font-mono text-xs px-2 py-1 rounded-md" style={{ color: P.text, border: `1px solid ${P.edge}`, background: "transparent" }}>download backup</button>
+                <button onClick={() => { localStorage.removeItem(CONFLICT_KEY); force((n) => n + 1); }} className="font-mono text-xs px-2 py-1 rounded-md" style={{ color: P.dim, border: `1px solid ${P.edge}`, background: "transparent" }}>dismiss</button>
+              </div>
+            </div>
+          )}
           <div className="font-mono text-xs mt-2" style={{ color: P.faint }}>keys live only in this browser · gist is private on your GitHub</div>
         </div>
       )}
@@ -316,19 +351,33 @@ export async function boot(mountNode) {
   if (localStorage.getItem(K_GH_TOKEN)) {
     setStatus("pulling");
     try { await adoptRemoteIfNewer(); } catch (e) { console.error(e); }
+    // iOS suspends timers on background and often kills the process — a prior
+    // session's debounced push may never have fired. Ship stranded edits now.
+    const m0 = getMeta();
+    if (m0.savedAt > m0.pushedAt) pushToGist();
   }
   // returning to the tab/app: pick up edits made on another device
   document.addEventListener("visibilitychange", async () => {
-    if (document.visibilityState !== "visible") return;
     if (!localStorage.getItem(K_GH_TOKEN)) return;
-    const unpushed = getMeta().savedAt > sync.lastPushedAt;
-    if (unpushed) { pushToGist(); return; } // our edits win; ship them
+    const m = getMeta();
+    if (document.visibilityState === "hidden") {
+      // iOS freezes timers the moment the app is backgrounded — the debounced
+      // push would never fire. Push NOW; keepalive lets it finish after suspend.
+      if (m.savedAt > m.pushedAt) {
+        if (sync.timer) { clearTimeout(sync.timer); sync.timer = null; }
+        pushToGist();
+      }
+      return;
+    }
+    if (document.visibilityState !== "visible") return;
+    if (m.savedAt > m.pushedAt) { pushToGist(); return; } // our edits win; ship them
     const adopted = await adoptRemoteIfNewer();
     if (adopted) location.reload();
   });
   // leaving: best-effort final push of anything pending
   window.addEventListener("pagehide", () => {
-    if (localStorage.getItem(K_GH_TOKEN) && getMeta().savedAt > sync.lastPushedAt) pushToGist();
+    const m = getMeta();
+    if (localStorage.getItem(K_GH_TOKEN) && m.savedAt > m.pushedAt) pushToGist();
   });
   const root = createRoot(mountNode);
   root.render(<Root />);
